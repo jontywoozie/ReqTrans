@@ -89,6 +89,14 @@ function schedulePersistSessions() {
   }, 200);
 }
 
+function summarizeTitle(text, fallback = "新会话") {
+  const oneLine = String(text || "").replace(/\s+/g, " ").trim();
+  if (!oneLine) return fallback;
+  const firstSentence = oneLine.split(/[。！？!?]/).find((s) => s.trim()) || oneLine;
+  const clean = firstSentence.trim();
+  return clean.length > 30 ? `${clean.slice(0, 30)}...` : clean;
+}
+
 function loadSessionsFromDisk() {
   try {
     ensureStorageDir();
@@ -122,42 +130,6 @@ function loadSessionsFromDisk() {
     console.error("Failed to load sessions:", error.message);
     sessions.clear();
   }
-}
-
-function writeJson(res, statusCode, payload) {
-  res.writeHead(statusCode, { "Content-Type": "application/json; charset=utf-8" });
-  res.end(JSON.stringify(payload));
-}
-
-function writeSseEvent(res, event, payload) {
-  res.write(`event: ${event}\n`);
-  res.write(`data: ${JSON.stringify(payload)}\n\n`);
-}
-
-function collectJsonBody(req) {
-  return new Promise((resolve, reject) => {
-    let raw = "";
-    req.on("data", (chunk) => {
-      raw += chunk.toString("utf8");
-      if (raw.length > 1024 * 1024) reject(new Error("Request body too large"));
-    });
-    req.on("end", () => {
-      try {
-        resolve(JSON.parse(raw || "{}"));
-      } catch {
-        reject(new Error("Invalid JSON body"));
-      }
-    });
-    req.on("error", () => reject(new Error("Failed to read request body")));
-  });
-}
-
-function summarizeTitle(text, fallback = "新会话") {
-  const oneLine = String(text || "").replace(/\s+/g, " ").trim();
-  if (!oneLine) return fallback;
-  const firstSentence = oneLine.split(/[。！？!?]/).find((s) => s.trim()) || oneLine;
-  const clean = firstSentence.trim();
-  return clean.length > 30 ? `${clean.slice(0, 30)}...` : clean;
 }
 
 function getSessionSummaries() {
@@ -206,7 +178,6 @@ function getOrCreateSession(sessionId, direction, title) {
     if (changed) schedulePersistSessions();
     return session;
   }
-
   return createSession(direction, title);
 }
 
@@ -223,6 +194,34 @@ function trimTranscript(session) {
   }
 }
 
+function writeJson(res, statusCode, payload) {
+  res.writeHead(statusCode, { "Content-Type": "application/json; charset=utf-8" });
+  res.end(JSON.stringify(payload));
+}
+
+function writeSseEvent(res, event, payload) {
+  res.write(`event: ${event}\n`);
+  res.write(`data: ${JSON.stringify(payload)}\n\n`);
+}
+
+function collectJsonBody(req) {
+  return new Promise((resolve, reject) => {
+    let raw = "";
+    req.on("data", (chunk) => {
+      raw += chunk.toString("utf8");
+      if (raw.length > 1024 * 1024) reject(new Error("Request body too large"));
+    });
+    req.on("end", () => {
+      try {
+        resolve(JSON.parse(raw || "{}"));
+      } catch {
+        reject(new Error("Invalid JSON body"));
+      }
+    });
+    req.on("error", () => reject(new Error("Failed to read request body")));
+  });
+}
+
 function detectInputLanguage(text) {
   const content = String(text || "");
   const cjkCount = (content.match(/[\u4e00-\u9fff]/g) || []).length;
@@ -230,80 +229,140 @@ function detectInputLanguage(text) {
   return cjkCount >= latinCount ? "zh" : "en";
 }
 
-function buildSystemPrompt(direction) {
+function buildRolePrompt(direction) {
   if (direction === "free_chat") {
     return [
-      "You are a helpful and concise bilingual assistant.",
-      "Keep responses natural, practical, and friendly.",
-      "You must use the same language as the user's latest input.",
-      "Do not fabricate facts, percentages, benchmark numbers, or business outcomes.",
-      "If specific numbers are not provided by user input or chat history, explicitly label them as '需验证' or 'to be verified'.",
-      "Do not force structured sections unless the user asks for them."
+      "You are a practical assistant for daily conversation.",
+      "Respond naturally and clearly.",
+      "Keep concise unless the user asks for detail."
     ].join(" ");
   }
 
   if (direction === "product_to_dev") {
     return [
-      "You translate product requirements into engineering language.",
-      "Use concise bullet points.",
-      "You must use the same language as the user's latest input.",
-      "Must include: technical approach, data needs, performance expectations, workload estimate, and risks.",
-      "Do not fabricate facts, percentages, benchmark numbers, or business outcomes.",
-      "If specific numbers are not provided by user input or chat history, explicitly label them as '需验证' or 'to be verified'.",
-      "If details are missing, add a short 'Missing info' list."
+      "You are a senior engineering architect translating PM language into executable engineering language.",
+      "Think in terms of architecture, data dependencies, performance constraints, implementation scope, and risk.",
+      "Avoid business fluff and focus on actionable engineering decisions."
     ].join(" ");
   }
 
   return [
-    "You translate engineering updates into product/business language.",
-    "Use concise bullet points.",
-    "You must use the same language as the user's latest input.",
-    "Must include: user impact, business impact, cost/efficiency impact, and rollout implications.",
-    "Do not fabricate facts, percentages, benchmark numbers, or business outcomes.",
-    "If specific numbers are not provided by user input or chat history, explicitly label them as '需验证' or 'to be verified'.",
-    "If details are missing, add a short 'Missing info' list."
+    "You are a senior product strategist translating engineering language into product/business language.",
+    "Think in terms of user impact, business impact, rollout plan, and decision support.",
+    "Avoid raw technical jargon without business interpretation."
   ].join(" ");
 }
 
-function buildUserPrompt(direction, text) {
-  const lang = detectInputLanguage(text);
-  const languageHint =
-    lang === "zh"
-      ? "请用中文回答，并保持术语准确。无法确认的数据请标注“需验证”。"
-      : "Please answer in English. Mark uncertain numbers as 'to be verified'.";
+function buildOutputSchemaPrompt(direction, lang) {
+  if (lang === "zh") {
+    if (direction === "free_chat") {
+      return [
+        "输出必须为中文。",
+        "除非用户明确要求，否则不要强制分段标题。",
+        "如存在不确定信息，请明确标注“需验证”，并给出一个澄清问题。"
+      ].join(" ");
+    }
 
-  if (direction === "free_chat") return text;
+    if (direction === "product_to_dev") {
+      return [
+        "输出必须为中文，且小标题必须是中文。",
+        "严格使用以下标题顺序：",
+        "【技术目标】、【实现方案】、【数据与依赖】、【性能与风险】、【MVP建议】、【缺失信息】。",
+        "每个标题下给出简洁要点。",
+        "如无缺失信息，写“无”。"
+      ].join(" ");
+    }
+
+    return [
+      "输出必须为中文，且小标题必须是中文。",
+      "严格使用以下标题顺序：",
+      "【变更解读】、【用户影响】、【业务影响】、【成本与效率】、【上线建议】、【缺失信息】。",
+      "每个标题下给出简洁要点。",
+      "如无缺失信息，写“无”。"
+    ].join(" ");
+  }
+
+  if (direction === "free_chat") {
+    return [
+      "Output must be in English.",
+      "Do not force section headings unless user asks.",
+      "If uncertain, explicitly say unknown and ask one clarifying question."
+    ].join(" ");
+  }
 
   if (direction === "product_to_dev") {
     return [
-      "Translate the following product requirement into executable engineering language.",
-      "Focus on specific and actionable details.",
-      languageHint,
+      "Output must be in English.",
+      "Use this exact section order:",
+      "[Technical Goal], [Implementation Options], [Data & Dependencies], [Performance & Risks], [MVP Plan], [Missing Info].",
+      "Each section should contain concise bullet points.",
+      "If no missing info, write 'None'."
+    ].join(" ");
+  }
+
+  return [
+    "Output must be in English.",
+    "Use this exact section order:",
+    "[Change Interpretation], [User Impact], [Business Impact], [Cost & Efficiency], [Rollout Advice], [Missing Info].",
+    "Each section should contain concise bullet points.",
+    "If no missing info, write 'None'."
+  ].join(" ");
+}
+
+function buildQualityGuardPrompt() {
+  return [
+    "Never fabricate percentages, benchmark numbers, or monetary outcomes.",
+    "If a number is not directly grounded in user input/history, mark it as '需验证' or 'to be verified'.",
+    "For every inference, prefer explicit uncertainty over confident guessing.",
+    "Make output directly usable in a product/engineering sync meeting."
+  ].join(" ");
+}
+
+function buildUserPrompt(direction, text, lang) {
+  const langHint =
+    lang === "zh"
+      ? "请严格使用中文。若有任何未确认数据，标注“需验证”。"
+      : "Please strictly use English. Mark uncertain numbers as 'to be verified'.";
+
+  if (direction === "free_chat") {
+    return [langHint, "", text].join("\n");
+  }
+
+  if (direction === "product_to_dev") {
+    return [
+      langHint,
+      "Translate the PM statement into engineering execution language.",
+      "Focus on implementation realism and missing constraints.",
       "",
-      "Product requirement:",
+      "Input:",
       text
     ].join("\n");
   }
 
   return [
-    "Translate the following engineering update into product/business language.",
-    "Focus on business impact and user value.",
-    languageHint,
+    langHint,
+    "Translate the engineering update into product/business decision language.",
+    "Focus on user/business implications and rollout guidance.",
     "",
-    "Engineering update:",
+    "Input:",
     text
   ].join("\n");
 }
 
 function buildMessages(direction, text, sessionHistory) {
-  const messages = [{ role: "system", content: buildSystemPrompt(direction) }];
+  const lang = detectInputLanguage(text);
+  const messages = [
+    { role: "system", content: buildRolePrompt(direction) },
+    { role: "system", content: buildOutputSchemaPrompt(direction, lang) },
+    { role: "system", content: buildQualityGuardPrompt() }
+  ];
 
   for (const item of sessionHistory) {
     messages.push({ role: item.role, content: item.content });
   }
 
-  messages.push({ role: "user", content: buildUserPrompt(direction, text) });
-  return messages;
+  messages.push({ role: "user", content: buildUserPrompt(direction, text, lang) });
+  return { messages, lang };
 }
 
 function sleep(ms) {
@@ -314,18 +373,15 @@ function isRetryableStatus(status) {
   return status === 429 || status === 503 || status === 502 || status === 504;
 }
 
-async function streamFromOpenAiCompatible({ messages, res }) {
-  if (!llmConfig.apiKey) throw new Error("Missing LLM_API_KEY (or OPENAI_API_KEY) in .env");
-  if (!llmConfig.baseUrl) throw new Error("Missing LLM_BASE_URL in .env");
-  if (!llmConfig.model) throw new Error("Missing LLM_MODEL in .env");
-
+async function callOpenAiCompatible({ messages, temperature = 0.6 }) {
   const endpoint = `${llmConfig.baseUrl.replace(/\/+$/, "")}/chat/completions`;
   const maxAttempts = Math.max(1, Math.floor(llmConfig.retryMax));
-  let upstream;
+
+  let lastStatus = 0;
   let lastReason = "";
 
   for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
-    upstream = await fetch(endpoint, {
+    const upstream = await fetch(endpoint, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -333,80 +389,154 @@ async function streamFromOpenAiCompatible({ messages, res }) {
       },
       body: JSON.stringify({
         model: llmConfig.model,
-        stream: true,
-        temperature: 0.6,
+        stream: false,
+        temperature,
         ...(resolvedMaxTokens ? { max_tokens: resolvedMaxTokens } : {}),
         messages
       })
     });
 
-    if (upstream.ok && upstream.body) break;
+    lastStatus = upstream.status;
+    const raw = await upstream.text();
 
-    lastReason = await upstream.text();
-    if (!isRetryableStatus(upstream.status) || attempt === maxAttempts) {
-      break;
+    if (!upstream.ok) {
+      lastReason = raw;
+      if (!isRetryableStatus(upstream.status) || attempt === maxAttempts) break;
+      const backoff = Math.max(200, Math.floor(llmConfig.retryBaseMs)) * 2 ** (attempt - 1);
+      await sleep(backoff);
+      continue;
     }
 
-    const backoff = Math.max(200, Math.floor(llmConfig.retryBaseMs)) * 2 ** (attempt - 1);
-    await sleep(backoff);
-  }
-
-  if (!upstream || !upstream.ok || !upstream.body) {
-    const status = upstream ? upstream.status : "unknown";
-    if (status === 429) {
-      throw new Error("模型当前繁忙（429），已自动重试仍失败，请稍后再试。");
+    let parsed;
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      throw new Error("Invalid upstream JSON response");
     }
-    throw new Error(`Upstream LLM error (${status}): ${lastReason || "unknown error"}`);
+
+    const choice = parsed?.choices?.[0] || {};
+    const content =
+      choice?.message?.content ||
+      choice?.text ||
+      choice?.delta?.content ||
+      "";
+
+    if (!String(content).trim()) {
+      throw new Error("Model produced no visible text");
+    }
+
+    return String(content);
   }
 
-  const reader = upstream.body.getReader();
-  const decoder = new TextDecoder("utf-8");
-  let buffer = "";
-  let fullText = "";
+  if (lastStatus === 429) {
+    throw new Error("模型当前繁忙（429），已自动重试仍失败，请稍后再试。");
+  }
+  throw new Error(`Upstream LLM error (${lastStatus || "unknown"}): ${lastReason || "unknown error"}`);
+}
 
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
+function validateOutputQuality({ direction, inputText, outputText, lang }) {
+  const issues = [];
+  const out = String(outputText || "").trim();
+  const src = String(inputText || "");
 
-    buffer += decoder.decode(value, { stream: true });
-    const lines = buffer.split(/\r?\n/);
-    buffer = lines.pop() || "";
+  if (!out) issues.push("Output is empty.");
 
-    for (const line of lines) {
-      const trimmed = line.trim();
-      if (!trimmed.startsWith("data:")) continue;
+  if (lang === "zh") {
+    const cjkRatio = ((out.match(/[\u4e00-\u9fff]/g) || []).length / Math.max(out.length, 1));
+    if (cjkRatio < 0.15) issues.push("Language mismatch: expected Chinese output.");
+  } else {
+    const latinRatio = ((out.match(/[A-Za-z]/g) || []).length / Math.max(out.length, 1));
+    if (latinRatio < 0.15) issues.push("Language mismatch: expected English output.");
+  }
 
-      const payload = trimmed.slice(5).trim();
-      if (!payload || payload === "[DONE]") continue;
+  if (direction === "product_to_dev") {
+    const required = lang === "zh"
+      ? ["技术目标", "实现方案", "数据与依赖", "性能与风险", "MVP建议", "缺失信息"]
+      : ["Technical Goal", "Implementation Options", "Data & Dependencies", "Performance & Risks", "MVP Plan", "Missing Info"];
+    const hasAll = required.every((k) => out.includes(k));
+    if (!hasAll) issues.push("Missing required sections for product_to_dev output.");
+  }
 
-      let parsed;
-      try {
-        parsed = JSON.parse(payload);
-      } catch {
-        continue;
+  if (direction === "dev_to_product") {
+    const required = lang === "zh"
+      ? ["变更解读", "用户影响", "业务影响", "成本与效率", "上线建议", "缺失信息"]
+      : ["Change Interpretation", "User Impact", "Business Impact", "Cost & Efficiency", "Rollout Advice", "Missing Info"];
+    const hasAll = required.every((k) => out.includes(k));
+    if (!hasAll) issues.push("Missing required sections for dev_to_product output.");
+  }
+
+  const outHasHardNumber = /\d+(\.\d+)?\s*(%|倍|ms|秒|元|万元|million|billion|\$)/i.test(out);
+  const srcHasNumber = /\d/.test(src);
+  const hasVerificationTag = out.includes("需验证") || /to be verified/i.test(out);
+  if (outHasHardNumber && !srcHasNumber && !hasVerificationTag) {
+    issues.push("Contains hard numbers without evidence or verification tag.");
+  }
+
+  return {
+    pass: issues.length === 0,
+    issues
+  };
+}
+
+async function generateWithQualityGuard({ direction, text, sessionHistory }) {
+  const { messages, lang } = buildMessages(direction, text, sessionHistory);
+  const firstPass = await callOpenAiCompatible({ messages, temperature: 0.6 });
+
+  const check = validateOutputQuality({
+    direction,
+    inputText: text,
+    outputText: firstPass,
+    lang
+  });
+
+  if (check.pass) return firstPass;
+
+  const rewriteMessages = [
+    {
+      role: "system",
+      content:
+        "You are a strict quality rewriter. Keep intent unchanged, only fix violations. Follow all constraints exactly."
+    },
+    {
+      role: "user",
+      content: [
+        `Direction: ${direction}`,
+        `Input language: ${lang}`,
+        "Issues:",
+        ...check.issues.map((x) => `- ${x}`),
+        "",
+        "Original user input:",
+        text,
+        "",
+        "Draft output to repair:",
+        firstPass,
+        "",
+        "Return only the repaired final answer."
+      ].join("\n")
+    }
+  ];
+
+  return callOpenAiCompatible({ messages: rewriteMessages, temperature: 0.2 });
+}
+
+function streamTextAsSse(res, text) {
+  const content = String(text || "");
+  let i = 0;
+
+  return new Promise((resolve) => {
+    const timer = setInterval(() => {
+      if (i >= content.length) {
+        clearInterval(timer);
+        resolve();
+        return;
       }
 
-      const choice = parsed?.choices?.[0] || {};
-      const token =
-        choice?.delta?.content ||
-        choice?.delta?.reasoning_content ||
-        choice?.message?.content ||
-        choice?.text ||
-        "";
-
-      if (token) {
-        const piece = String(token);
-        fullText += piece;
-        writeSseEvent(res, "chunk", { chunk: piece });
-      }
-    }
-  }
-
-  if (!fullText.trim()) {
-    throw new Error("Model produced no visible text. Try a different model or retry.");
-  }
-
-  return fullText;
+      const step = Math.max(4, Math.min(18, Math.floor(content.length / 60)));
+      const chunk = content.slice(i, i + step);
+      i += step;
+      writeSseEvent(res, "chunk", { chunk });
+    }, 12);
+  });
 }
 
 const server = http.createServer(async (req, res) => {
@@ -529,7 +659,6 @@ const server = http.createServer(async (req, res) => {
     if (!session.history.length && !incomingTitle) {
       session.title = summarizeTitle(text, session.title);
     }
-    const messages = buildMessages(direction, text, session.history);
 
     res.writeHead(200, {
       "Content-Type": "text/event-stream; charset=utf-8",
@@ -548,9 +677,16 @@ const server = http.createServer(async (req, res) => {
         throw new Error("Only LLM_PROVIDER=openai_compatible is supported currently");
       }
 
-      const assistantText = await streamFromOpenAiCompatible({ messages, res });
+      const assistantText = await generateWithQualityGuard({
+        direction,
+        text,
+        sessionHistory: session.history
+      });
 
-      session.history.push({ role: "user", content: buildUserPrompt(direction, text) });
+      await streamTextAsSse(res, assistantText);
+
+      const wrappedUser = buildUserPrompt(direction, text, detectInputLanguage(text));
+      session.history.push({ role: "user", content: wrappedUser });
       session.history.push({ role: "assistant", content: assistantText });
       session.transcript.push({ role: "user", content: text, ts: Date.now() });
       session.transcript.push({ role: "assistant", content: assistantText, ts: Date.now() });
@@ -582,7 +718,7 @@ server.listen(PORT, () => {
   console.log(`Backend listening on http://localhost:${PORT}`);
 });
 
-process.on("SIGINT", () => {
+function flushAndExit() {
   try {
     if (persistTimer) {
       clearTimeout(persistTimer);
@@ -591,15 +727,7 @@ process.on("SIGINT", () => {
     persistSessionsToDiskSync();
   } catch {}
   process.exit(0);
-});
+}
 
-process.on("SIGTERM", () => {
-  try {
-    if (persistTimer) {
-      clearTimeout(persistTimer);
-      persistTimer = null;
-    }
-    persistSessionsToDiskSync();
-  } catch {}
-  process.exit(0);
-});
+process.on("SIGINT", flushAndExit);
+process.on("SIGTERM", flushAndExit);
