@@ -1,0 +1,13 @@
+{
+  "name": "reqtrans-agent",
+  "version": "0.1.0",
+  "private": true,
+  "description": "AI communication translator between Product and Engineering",
+  "scripts": {
+    "dev": "node backend/server.js",
+    "dev:backend": "node backend/server.js",
+    "dev:frontend": "node frontend/server.js",
+    "start": "node backend/server.js",
+    "start:frontend": "node frontend/server.js"
+  }
+}
