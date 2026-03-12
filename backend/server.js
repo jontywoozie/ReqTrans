@@ -1,18 +1,37 @@
-const fs = require("fs");
+﻿const fs = require("fs");
 const path = require("path");
 const http = require("http");
+const crypto = require("crypto");
 
 loadEnvFile(path.join(process.cwd(), ".env"));
 
 const PORT = Number(process.env.BACKEND_PORT || 43127);
-const VALID_DIRECTIONS = new Set(["product_to_dev", "dev_to_product"]);
+const VALID_DIRECTIONS = new Set(["product_to_dev", "dev_to_product", "free_chat"]);
+const MAX_CONTEXT_MESSAGES = Number(process.env.SESSION_CONTEXT_MESSAGES || 12);
 
 const llmConfig = {
   provider: String(process.env.LLM_PROVIDER || "openai_compatible").trim(),
   baseUrl: String(process.env.LLM_BASE_URL || "https://api.openai.com/v1").trim(),
   apiKey: String(process.env.LLM_API_KEY || process.env.OPENAI_API_KEY || "").trim(),
-  model: String(process.env.LLM_MODEL || "gpt-4.1-mini").trim()
+  model: String(process.env.LLM_MODEL || "gpt-4.1-mini").trim(),
+  maxTokens: process.env.LLM_MAX_TOKENS,
+  retryMax: Number(process.env.LLM_RETRY_MAX || 3),
+  retryBaseMs: Number(process.env.LLM_RETRY_BASE_MS || 800)
 };
+
+const parsedMaxTokens = Number(llmConfig.maxTokens);
+const resolvedMaxTokens =
+  llmConfig.maxTokens === undefined || llmConfig.maxTokens === null || llmConfig.maxTokens === ""
+    ? null
+    : Number.isFinite(parsedMaxTokens)
+      ? Math.max(64, Math.floor(parsedMaxTokens))
+      : null;
+
+const sessions = new Map();
+const STORAGE_DIR = path.join(process.cwd(), "storage");
+const SESSIONS_FILE = path.join(STORAGE_DIR, "sessions.json");
+const SESSIONS_TMP_FILE = path.join(STORAGE_DIR, "sessions.json.tmp");
+let persistTimer = null;
 
 function loadEnvFile(filePath) {
   if (!fs.existsSync(filePath)) return;
@@ -26,6 +45,152 @@ function loadEnvFile(filePath) {
     const key = trimmed.slice(0, splitAt).trim();
     const value = trimmed.slice(splitAt + 1).trim().replace(/^['"]|['"]$/g, "");
     if (!(key in process.env)) process.env[key] = value;
+  }
+}
+
+function ensureStorageDir() {
+  fs.mkdirSync(STORAGE_DIR, { recursive: true });
+}
+
+function toSerializableSession(session) {
+  return {
+    id: session.id,
+    direction: session.direction,
+    title: session.title,
+    preview: session.preview || "",
+    history: Array.isArray(session.history) ? session.history : [],
+    transcript: Array.isArray(session.transcript) ? session.transcript : [],
+    createdAt: Number(session.createdAt || Date.now()),
+    updatedAt: Number(session.updatedAt || Date.now())
+  };
+}
+
+function persistSessionsToDiskSync() {
+  ensureStorageDir();
+  const payload = {
+    version: 1,
+    updatedAt: Date.now(),
+    sessions: Array.from(sessions.values()).map(toSerializableSession)
+  };
+  const json = `${JSON.stringify(payload, null, 2)}\n`;
+  fs.writeFileSync(SESSIONS_TMP_FILE, json, "utf8");
+  fs.renameSync(SESSIONS_TMP_FILE, SESSIONS_FILE);
+}
+
+function schedulePersistSessions() {
+  if (persistTimer) return;
+  persistTimer = setTimeout(() => {
+    persistTimer = null;
+    try {
+      persistSessionsToDiskSync();
+    } catch (error) {
+      console.error("Failed to persist sessions:", error.message);
+    }
+  }, 200);
+}
+
+function summarizeTitle(text, fallback = "新会话") {
+  const oneLine = String(text || "").replace(/\s+/g, " ").trim();
+  if (!oneLine) return fallback;
+  const firstSentence = oneLine.split(/[。！？!?]/).find((s) => s.trim()) || oneLine;
+  const clean = firstSentence.trim();
+  return clean.length > 30 ? `${clean.slice(0, 30)}...` : clean;
+}
+
+function loadSessionsFromDisk() {
+  try {
+    ensureStorageDir();
+    if (!fs.existsSync(SESSIONS_FILE)) {
+      persistSessionsToDiskSync();
+      return;
+    }
+
+    const raw = fs.readFileSync(SESSIONS_FILE, "utf8");
+    const parsed = JSON.parse(raw || "{}");
+    const arr = Array.isArray(parsed.sessions) ? parsed.sessions : [];
+    sessions.clear();
+
+    for (const item of arr) {
+      if (!item || typeof item !== "object") continue;
+      const id = String(item.id || "").trim();
+      if (!id) continue;
+
+      sessions.set(id, {
+        id,
+        direction: VALID_DIRECTIONS.has(item.direction) ? item.direction : "free_chat",
+        title: summarizeTitle(item.title || "新会话"),
+        preview: String(item.preview || ""),
+        history: Array.isArray(item.history) ? item.history : [],
+        transcript: Array.isArray(item.transcript) ? item.transcript : [],
+        createdAt: Number(item.createdAt || Date.now()),
+        updatedAt: Number(item.updatedAt || Date.now())
+      });
+    }
+  } catch (error) {
+    console.error("Failed to load sessions:", error.message);
+    sessions.clear();
+  }
+}
+
+function getSessionSummaries() {
+  return Array.from(sessions.values())
+    .sort((a, b) => b.updatedAt - a.updatedAt)
+    .map((s) => ({
+      id: s.id,
+      title: s.title,
+      direction: s.direction,
+      preview: s.preview || "",
+      updated_at: s.updatedAt,
+      created_at: s.createdAt
+    }));
+}
+
+function createSession(direction = "free_chat", title = "新会话") {
+  const sessionId = crypto.randomUUID();
+  const session = {
+    id: sessionId,
+    direction,
+    title: summarizeTitle(title),
+    preview: "",
+    history: [],
+    transcript: [],
+    createdAt: Date.now(),
+    updatedAt: Date.now()
+  };
+  sessions.set(sessionId, session);
+  schedulePersistSessions();
+  return session;
+}
+
+function getOrCreateSession(sessionId, direction, title) {
+  if (sessionId && sessions.has(sessionId)) {
+    const session = sessions.get(sessionId);
+    let changed = false;
+    if (direction && VALID_DIRECTIONS.has(direction)) session.direction = direction;
+    if (title) {
+      const nextTitle = summarizeTitle(title, session.title);
+      if (nextTitle !== session.title) {
+        session.title = nextTitle;
+        changed = true;
+      }
+    }
+    session.updatedAt = Date.now();
+    if (changed) schedulePersistSessions();
+    return session;
+  }
+  return createSession(direction, title);
+}
+
+function trimHistory(session) {
+  if (session.history.length > MAX_CONTEXT_MESSAGES) {
+    session.history = session.history.slice(-MAX_CONTEXT_MESSAGES);
+  }
+}
+
+function trimTranscript(session) {
+  const maxTranscript = MAX_CONTEXT_MESSAGES * 4;
+  if (session.transcript.length > maxTranscript) {
+    session.transcript = session.transcript.slice(-maxTranscript);
   }
 }
 
@@ -57,123 +222,325 @@ function collectJsonBody(req) {
   });
 }
 
-function buildSystemPrompt(direction) {
+function detectInputLanguage(text) {
+  const content = String(text || "");
+  const cjkCount = (content.match(/[\u4e00-\u9fff]/g) || []).length;
+  const latinCount = (content.match(/[A-Za-z]/g) || []).length;
+  return cjkCount >= latinCount ? "zh" : "en";
+}
+
+function buildRolePrompt(direction) {
+  if (direction === "free_chat") {
+    return [
+      "You are a practical assistant for daily conversation.",
+      "Respond naturally and clearly.",
+      "Keep concise unless the user asks for detail."
+    ].join(" ");
+  }
+
   if (direction === "product_to_dev") {
     return [
-      "你是资深技术方案架构师，负责把产品语言翻译为工程可执行语言。",
-      "输出语言必须与用户输入一致；若输入是中文，输出必须是中文。",
-      "禁止空泛表达，必须给出可落地项。",
-      "必须严格使用以下结构并按顺序输出：",
-      "【技术目标】1-2条",
-      "【实现方案】2-4条（算法/架构方向）",
-      "【数据与依赖】2-4条（数据来源、埋点、外部依赖）",
-      "【性能与风险】2-4条（时延、吞吐、稳定性、风险）",
-      "【工作量预估】1-3条（按MVP/增强版）",
-      "【Missing info】列出3条以内待确认问题；若信息充分，写“无”。"
+      "You are a senior engineering architect translating PM language into executable engineering language.",
+      "Think in terms of architecture, data dependencies, performance constraints, implementation scope, and risk.",
+      "Avoid business fluff and focus on actionable engineering decisions."
     ].join(" ");
   }
 
   return [
-    "你是资深产品策略顾问，负责把技术语言翻译为产品/业务语言。",
-    "输出语言必须与用户输入一致；若输入是中文，输出必须是中文。",
-    "禁止只讲技术细节，必须转化为业务含义和用户价值。",
-    "必须严格使用以下结构并按顺序输出：",
-    "【变更解读】1-2条（技术动作被翻译成业务动作）",
-    "【用户影响】2-4条（体验、成功率、等待时长等）",
-    "【业务影响】2-4条（转化、留存、增长空间）",
-    "【成本与效率】1-3条（资源成本、人效、交付速度）",
-    "【上线建议】1-3条（灰度、监控指标、对齐事项）",
-    "【Missing info】列出3条以内待确认问题；若信息充分，写“无”。"
+    "You are a senior product strategist translating engineering language into product/business language.",
+    "Think in terms of user impact, business impact, rollout plan, and decision support.",
+    "Avoid raw technical jargon without business interpretation."
   ].join(" ");
 }
 
-function buildUserPrompt(direction, text) {
+function buildOutputSchemaPrompt(direction, lang) {
+  if (lang === "zh") {
+    if (direction === "free_chat") {
+      return [
+        "输出必须为中文。",
+        "除非用户明确要求，否则不要强制分段标题。",
+        "如存在不确定信息，请明确标注“需验证”，并给出一个澄清问题。"
+      ].join(" ");
+    }
+
+    if (direction === "product_to_dev") {
+      return [
+        "输出必须为中文，且小标题必须是中文。",
+        "严格使用以下标题顺序：",
+        "【技术目标】、【实现方案】、【数据与依赖】、【性能与风险】、【MVP建议】、【缺失信息】。",
+        "每个标题下给出简洁要点。",
+        "如无缺失信息，写“无”。"
+      ].join(" ");
+    }
+
+    return [
+      "输出必须为中文，且小标题必须是中文。",
+      "严格使用以下标题顺序：",
+      "【变更解读】、【用户影响】、【业务影响】、【成本与效率】、【上线建议】、【缺失信息】。",
+      "每个标题下给出简洁要点。",
+      "如无缺失信息，写“无”。"
+    ].join(" ");
+  }
+
+  if (direction === "free_chat") {
+    return [
+      "Output must be in English.",
+      "Do not force section headings unless user asks.",
+      "If uncertain, explicitly say unknown and ask one clarifying question."
+    ].join(" ");
+  }
+
   if (direction === "product_to_dev") {
     return [
-      "请将以下“产品需求描述”翻译为“工程执行说明”。",
-      "要求：每条尽量具体，可直接用于需求评审。",
+      "Output must be in English.",
+      "Use this exact section order:",
+      "[Technical Goal], [Implementation Options], [Data & Dependencies], [Performance & Risks], [MVP Plan], [Missing Info].",
+      "Each section should contain concise bullet points.",
+      "If no missing info, write 'None'."
+    ].join(" ");
+  }
+
+  return [
+    "Output must be in English.",
+    "Use this exact section order:",
+    "[Change Interpretation], [User Impact], [Business Impact], [Cost & Efficiency], [Rollout Advice], [Missing Info].",
+    "Each section should contain concise bullet points.",
+    "If no missing info, write 'None'."
+  ].join(" ");
+}
+
+function buildQualityGuardPrompt() {
+  return [
+    "Never fabricate percentages, benchmark numbers, or monetary outcomes.",
+    "If a number is not directly grounded in user input/history, mark it as '需验证' or 'to be verified'.",
+    "For every inference, prefer explicit uncertainty over confident guessing.",
+    "Make output directly usable in a product/engineering sync meeting."
+  ].join(" ");
+}
+
+function buildUserPrompt(direction, text, lang) {
+  const langHint =
+    lang === "zh"
+      ? "请严格使用中文。若有任何未确认数据，标注“需验证”。"
+      : "Please strictly use English. Mark uncertain numbers as 'to be verified'.";
+
+  if (direction === "free_chat") {
+    return [langHint, "", text].join("\n");
+  }
+
+  if (direction === "product_to_dev") {
+    return [
+      langHint,
+      "Translate the PM statement into engineering execution language.",
+      "Focus on implementation realism and missing constraints.",
       "",
-      "产品需求描述：",
+      "Input:",
       text
     ].join("\n");
   }
 
   return [
-    "请将以下“技术实现描述”翻译为“产品/业务说明”。",
-    "要求：每条都要体现业务价值，便于产品和管理层理解。",
+    langHint,
+    "Translate the engineering update into product/business decision language.",
+    "Focus on user/business implications and rollout guidance.",
     "",
-    "技术实现描述：",
+    "Input:",
     text
   ].join("\n");
 }
 
-async function streamFromOpenAiCompatible({ direction, text, res }) {
-  if (!llmConfig.apiKey) {
-    throw new Error("Missing LLM_API_KEY (or OPENAI_API_KEY) in .env");
-  }
-  if (!llmConfig.baseUrl) {
-    throw new Error("Missing LLM_BASE_URL in .env");
-  }
-  if (!llmConfig.model) {
-    throw new Error("Missing LLM_MODEL in .env");
+function buildMessages(direction, text, sessionHistory) {
+  const lang = detectInputLanguage(text);
+  const messages = [
+    { role: "system", content: buildRolePrompt(direction) },
+    { role: "system", content: buildOutputSchemaPrompt(direction, lang) },
+    { role: "system", content: buildQualityGuardPrompt() }
+  ];
+
+  for (const item of sessionHistory) {
+    messages.push({ role: item.role, content: item.content });
   }
 
+  messages.push({ role: "user", content: buildUserPrompt(direction, text, lang) });
+  return { messages, lang };
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function isRetryableStatus(status) {
+  return status === 429 || status === 503 || status === 502 || status === 504;
+}
+
+async function callOpenAiCompatible({ messages, temperature = 0.6 }) {
   const endpoint = `${llmConfig.baseUrl.replace(/\/+$/, "")}/chat/completions`;
-  const upstream = await fetch(endpoint, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${llmConfig.apiKey}`
-    },
-    body: JSON.stringify({
-      model: llmConfig.model,
-      stream: true,
-      temperature: 0.3,
-      messages: [
-        { role: "system", content: buildSystemPrompt(direction) },
-        { role: "user", content: buildUserPrompt(direction, text) }
-      ]
-    })
+  const maxAttempts = Math.max(1, Math.floor(llmConfig.retryMax));
+
+  let lastStatus = 0;
+  let lastReason = "";
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    const upstream = await fetch(endpoint, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${llmConfig.apiKey}`
+      },
+      body: JSON.stringify({
+        model: llmConfig.model,
+        stream: false,
+        temperature,
+        ...(resolvedMaxTokens ? { max_tokens: resolvedMaxTokens } : {}),
+        messages
+      })
+    });
+
+    lastStatus = upstream.status;
+    const raw = await upstream.text();
+
+    if (!upstream.ok) {
+      lastReason = raw;
+      if (!isRetryableStatus(upstream.status) || attempt === maxAttempts) break;
+      const backoff = Math.max(200, Math.floor(llmConfig.retryBaseMs)) * 2 ** (attempt - 1);
+      await sleep(backoff);
+      continue;
+    }
+
+    let parsed;
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      throw new Error("Invalid upstream JSON response");
+    }
+
+    const choice = parsed?.choices?.[0] || {};
+    const content =
+      choice?.message?.content ||
+      choice?.text ||
+      choice?.delta?.content ||
+      "";
+
+    if (!String(content).trim()) {
+      throw new Error("Model produced no visible text");
+    }
+
+    return String(content);
+  }
+
+  if (lastStatus === 429) {
+    throw new Error("模型当前繁忙（429），已自动重试仍失败，请稍后再试。");
+  }
+  throw new Error(`Upstream LLM error (${lastStatus || "unknown"}): ${lastReason || "unknown error"}`);
+}
+
+function validateOutputQuality({ direction, inputText, outputText, lang }) {
+  const issues = [];
+  const out = String(outputText || "").trim();
+  const src = String(inputText || "");
+
+  if (!out) issues.push("Output is empty.");
+
+  if (lang === "zh") {
+    const cjkRatio = ((out.match(/[\u4e00-\u9fff]/g) || []).length / Math.max(out.length, 1));
+    if (cjkRatio < 0.15) issues.push("Language mismatch: expected Chinese output.");
+  } else {
+    const latinRatio = ((out.match(/[A-Za-z]/g) || []).length / Math.max(out.length, 1));
+    if (latinRatio < 0.15) issues.push("Language mismatch: expected English output.");
+  }
+
+  if (direction === "product_to_dev") {
+    const required = lang === "zh"
+      ? ["技术目标", "实现方案", "数据与依赖", "性能与风险", "MVP建议", "缺失信息"]
+      : ["Technical Goal", "Implementation Options", "Data & Dependencies", "Performance & Risks", "MVP Plan", "Missing Info"];
+    const hasAll = required.every((k) => out.includes(k));
+    if (!hasAll) issues.push("Missing required sections for product_to_dev output.");
+  }
+
+  if (direction === "dev_to_product") {
+    const required = lang === "zh"
+      ? ["变更解读", "用户影响", "业务影响", "成本与效率", "上线建议", "缺失信息"]
+      : ["Change Interpretation", "User Impact", "Business Impact", "Cost & Efficiency", "Rollout Advice", "Missing Info"];
+    const hasAll = required.every((k) => out.includes(k));
+    if (!hasAll) issues.push("Missing required sections for dev_to_product output.");
+  }
+
+  const outHasHardNumber = /\d+(\.\d+)?\s*(%|倍|ms|秒|元|万元|million|billion|\$)/i.test(out);
+  const srcHasNumber = /\d/.test(src);
+  const hasVerificationTag = out.includes("需验证") || /to be verified/i.test(out);
+  if (outHasHardNumber && !srcHasNumber && !hasVerificationTag) {
+    issues.push("Contains hard numbers without evidence or verification tag.");
+  }
+
+  return {
+    pass: issues.length === 0,
+    issues
+  };
+}
+
+async function generateWithQualityGuard({ direction, text, sessionHistory }) {
+  const { messages, lang } = buildMessages(direction, text, sessionHistory);
+  const firstPass = await callOpenAiCompatible({ messages, temperature: 0.6 });
+
+  const check = validateOutputQuality({
+    direction,
+    inputText: text,
+    outputText: firstPass,
+    lang
   });
 
-  if (!upstream.ok || !upstream.body) {
-    const reason = await upstream.text();
-    throw new Error(`Upstream LLM error (${upstream.status}): ${reason || "unknown error"}`);
-  }
+  if (check.pass) return firstPass;
 
-  const reader = upstream.body.getReader();
-  const decoder = new TextDecoder("utf-8");
-  let buffer = "";
+  const rewriteMessages = [
+    {
+      role: "system",
+      content:
+        "You are a strict quality rewriter. Keep intent unchanged, only fix violations. Follow all constraints exactly."
+    },
+    {
+      role: "user",
+      content: [
+        `Direction: ${direction}`,
+        `Input language: ${lang}`,
+        "Issues:",
+        ...check.issues.map((x) => `- ${x}`),
+        "",
+        "Original user input:",
+        text,
+        "",
+        "Draft output to repair:",
+        firstPass,
+        "",
+        "Return only the repaired final answer."
+      ].join("\n")
+    }
+  ];
 
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
+  return callOpenAiCompatible({ messages: rewriteMessages, temperature: 0.2 });
+}
 
-    buffer += decoder.decode(value, { stream: true });
-    const lines = buffer.split(/\r?\n/);
-    buffer = lines.pop() || "";
+function streamTextAsSse(res, text) {
+  const content = String(text || "");
+  let i = 0;
 
-    for (const line of lines) {
-      const trimmed = line.trim();
-      if (!trimmed.startsWith("data:")) continue;
-
-      const payload = trimmed.slice(5).trim();
-      if (!payload || payload === "[DONE]") continue;
-
-      let parsed;
-      try {
-        parsed = JSON.parse(payload);
-      } catch {
-        continue;
+  return new Promise((resolve) => {
+    const timer = setInterval(() => {
+      if (i >= content.length) {
+        clearInterval(timer);
+        resolve();
+        return;
       }
 
-      const token = parsed?.choices?.[0]?.delta?.content;
-      if (token) writeSseEvent(res, "chunk", { chunk: token });
-    }
-  }
+      const step = Math.max(4, Math.min(18, Math.floor(content.length / 60)));
+      const chunk = content.slice(i, i + step);
+      i += step;
+      writeSseEvent(res, "chunk", { chunk });
+    }, 12);
+  });
 }
 
 const server = http.createServer(async (req, res) => {
+  const requestUrl = new URL(req.url, `http://${req.headers.host || "localhost"}`);
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "POST, GET, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
@@ -184,17 +551,88 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  if (req.method === "GET" && req.url === "/health") {
+  if (req.method === "GET" && requestUrl.pathname === "/health") {
     writeJson(res, 200, {
       ok: true,
       service: "reqtrans-agent",
       llm_provider: llmConfig.provider,
-      llm_model: llmConfig.model
+      llm_model: llmConfig.model,
+      llm_max_tokens: resolvedMaxTokens ?? "provider_default",
+      sessions: sessions.size
     });
     return;
   }
 
-  if (req.method === "POST" && req.url === "/translate/stream") {
+  if (req.method === "GET" && requestUrl.pathname === "/session/list") {
+    writeJson(res, 200, { sessions: getSessionSummaries() });
+    return;
+  }
+
+  if (req.method === "GET" && requestUrl.pathname === "/session/history") {
+    const sessionId = String(requestUrl.searchParams.get("session_id") || "").trim();
+    if (!sessionId) {
+      writeJson(res, 400, { error: "session_id is required" });
+      return;
+    }
+    if (!sessions.has(sessionId)) {
+      writeJson(res, 404, { error: "session not found" });
+      return;
+    }
+
+    const session = sessions.get(sessionId);
+    writeJson(res, 200, {
+      session: {
+        id: session.id,
+        title: session.title,
+        direction: session.direction,
+        updated_at: session.updatedAt
+      },
+      messages: session.transcript || []
+    });
+    return;
+  }
+
+  if (req.method === "POST" && requestUrl.pathname === "/session/new") {
+    let body = {};
+    try {
+      body = await collectJsonBody(req);
+    } catch {
+      body = {};
+    }
+
+    const direction = VALID_DIRECTIONS.has(body.direction) ? body.direction : "free_chat";
+    const title = String(body.title || "").trim() || "新会话";
+    const session = createSession(direction, title);
+    writeJson(res, 200, {
+      session_id: session.id,
+      direction: session.direction,
+      title: session.title
+    });
+    return;
+  }
+
+  if (req.method === "POST" && requestUrl.pathname === "/session/clear") {
+    let body;
+    try {
+      body = await collectJsonBody(req);
+    } catch (error) {
+      writeJson(res, 400, { error: error.message });
+      return;
+    }
+
+    const sessionId = String(body.session_id || "").trim();
+    if (!sessionId) {
+      writeJson(res, 400, { error: "session_id is required" });
+      return;
+    }
+
+    sessions.delete(sessionId);
+    schedulePersistSessions();
+    writeJson(res, 200, { ok: true, cleared: sessionId });
+    return;
+  }
+
+  if (req.method === "POST" && requestUrl.pathname === "/translate/stream") {
     let body;
     try {
       body = await collectJsonBody(req);
@@ -205,14 +643,21 @@ const server = http.createServer(async (req, res) => {
 
     const direction = String(body.direction || "").trim();
     const text = String(body.text || "").trim();
+    const incomingSessionId = String(body.session_id || "").trim();
+    const incomingTitle = String(body.title || "").trim();
 
     if (!VALID_DIRECTIONS.has(direction)) {
-      writeJson(res, 400, { error: "Invalid direction, use product_to_dev or dev_to_product" });
+      writeJson(res, 400, { error: "Invalid direction, use product_to_dev, dev_to_product or free_chat" });
       return;
     }
     if (!text) {
       writeJson(res, 400, { error: "text is required" });
       return;
+    }
+
+    const session = getOrCreateSession(incomingSessionId, direction, incomingTitle);
+    if (!session.history.length && !incomingTitle) {
+      session.title = summarizeTitle(text, session.title);
     }
 
     res.writeHead(200, {
@@ -221,12 +666,41 @@ const server = http.createServer(async (req, res) => {
       Connection: "keep-alive"
     });
 
+    writeSseEvent(res, "session", {
+      session_id: session.id,
+      direction: session.direction,
+      title: session.title
+    });
+
     try {
       if (llmConfig.provider !== "openai_compatible") {
         throw new Error("Only LLM_PROVIDER=openai_compatible is supported currently");
       }
-      await streamFromOpenAiCompatible({ direction, text, res });
-      writeSseEvent(res, "done", { finished: true });
+
+      const assistantText = await generateWithQualityGuard({
+        direction,
+        text,
+        sessionHistory: session.history
+      });
+
+      await streamTextAsSse(res, assistantText);
+
+      const wrappedUser = buildUserPrompt(direction, text, detectInputLanguage(text));
+      session.history.push({ role: "user", content: wrappedUser });
+      session.history.push({ role: "assistant", content: assistantText });
+      session.transcript.push({ role: "user", content: text, ts: Date.now() });
+      session.transcript.push({ role: "assistant", content: assistantText, ts: Date.now() });
+      session.preview = summarizeTitle(text, session.preview);
+      session.updatedAt = Date.now();
+      trimHistory(session);
+      trimTranscript(session);
+      schedulePersistSessions();
+
+      writeSseEvent(res, "done", {
+        finished: true,
+        session_id: session.id,
+        title: session.title
+      });
       res.end();
     } catch (error) {
       writeSseEvent(res, "error", { message: error.message || "Streaming failed" });
@@ -238,6 +712,22 @@ const server = http.createServer(async (req, res) => {
   writeJson(res, 404, { error: "Not Found" });
 });
 
+loadSessionsFromDisk();
+
 server.listen(PORT, () => {
   console.log(`Backend listening on http://localhost:${PORT}`);
 });
+
+function flushAndExit() {
+  try {
+    if (persistTimer) {
+      clearTimeout(persistTimer);
+      persistTimer = null;
+    }
+    persistSessionsToDiskSync();
+  } catch {}
+  process.exit(0);
+}
+
+process.on("SIGINT", flushAndExit);
+process.on("SIGTERM", flushAndExit);
