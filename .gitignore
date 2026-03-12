@@ -1,3 +1,5 @@
 node_modules/
 .env
 npm-debug.log*
+storage/sessions.json
+storage/sessions.json.tmp
