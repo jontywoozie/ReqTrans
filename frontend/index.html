@@ -4,9 +4,185 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>ReqTrans Agent</title>
+    <style>
+      body {
+        font-family: "Segoe UI", sans-serif;
+        max-width: 860px;
+        margin: 24px auto;
+        padding: 0 16px;
+      }
+      label,
+      button,
+      select,
+      textarea {
+        display: block;
+        margin-top: 12px;
+      }
+      textarea {
+        width: 100%;
+        min-height: 120px;
+      }
+      pre {
+        white-space: pre-wrap;
+        background: #f6f8fa;
+        border: 1px solid #d0d7de;
+        padding: 12px;
+        min-height: 180px;
+      }
+      .hint {
+        color: #57606a;
+        font-size: 14px;
+      }
+      .error {
+        color: #b42318;
+      }
+    </style>
   </head>
   <body>
     <h1>ReqTrans Agent</h1>
-    <p>Frontend is running on a custom uncommon port.</p>
+    <p class="hint">仅支持流式接口：POST /translate/stream</p>
+
+    <label for="direction">翻译方向</label>
+    <select id="direction">
+      <option value="product_to_dev">产品 -> 开发</option>
+      <option value="dev_to_product">开发 -> 产品</option>
+    </select>
+
+    <label for="sourceText">输入内容</label>
+    <textarea id="sourceText" placeholder="请输入要翻译的内容"></textarea>
+
+    <button id="translateBtn" type="button">开始流式翻译</button>
+    <p class="hint" id="status">状态：待开始</p>
+    <p class="hint error" id="error"></p>
+
+    <label for="result">流式结果</label>
+    <pre id="result"></pre>
+
+    <script>
+      const directionEl = document.getElementById("direction");
+      const sourceTextEl = document.getElementById("sourceText");
+      const resultEl = document.getElementById("result");
+      const statusEl = document.getElementById("status");
+      const errorEl = document.getElementById("error");
+      const buttonEl = document.getElementById("translateBtn");
+
+      const backendPort = 43127;
+      const backendUrl = `http://${window.location.hostname || "localhost"}:${backendPort}/translate/stream`;
+
+      function setBusy(busy) {
+        buttonEl.disabled = busy;
+        buttonEl.textContent = busy ? "翻译中..." : "开始流式翻译";
+      }
+
+      function setStatus(text) {
+        statusEl.textContent = `状态：${text}`;
+      }
+
+      function setError(text) {
+        errorEl.textContent = text || "";
+      }
+
+      function parseSseBlock(block) {
+        const lines = block.split("\n");
+        const eventLine = lines.find((line) => line.startsWith("event:"));
+        const dataLine = lines.find((line) => line.startsWith("data:"));
+        if (!eventLine || !dataLine) return null;
+
+        const event = eventLine.slice(6).trim();
+        const rawData = dataLine.slice(5).trim();
+        let data = {};
+
+        try {
+          data = JSON.parse(rawData);
+        } catch {
+          data = { message: rawData };
+        }
+
+        return { event, data };
+      }
+
+      async function parseErrorResponse(response) {
+        try {
+          const text = await response.text();
+          if (!text) return `请求失败 (${response.status})`;
+          try {
+            const parsed = JSON.parse(text);
+            return parsed.error || text;
+          } catch {
+            return text;
+          }
+        } catch {
+          return `请求失败 (${response.status})`;
+        }
+      }
+
+      async function startStreaming() {
+        const direction = directionEl.value;
+        const text = sourceTextEl.value.trim();
+
+        resultEl.textContent = "";
+        setError("");
+
+        if (!text) {
+          setStatus("请输入内容");
+          return;
+        }
+
+        setBusy(true);
+        setStatus("请求已发送，等待流式返回...");
+
+        try {
+          const response = await fetch(backendUrl, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ direction, text })
+          });
+
+          if (!response.ok || !response.body) {
+            const message = await parseErrorResponse(response);
+            throw new Error(message);
+          }
+
+          const reader = response.body.getReader();
+          const decoder = new TextDecoder("utf-8");
+          let buffer = "";
+
+          while (true) {
+            const { value, done } = await reader.read();
+            if (done) break;
+
+            buffer += decoder.decode(value, { stream: true });
+            const messages = buffer.split("\n\n");
+            buffer = messages.pop() || "";
+
+            for (const message of messages) {
+              const parsed = parseSseBlock(message);
+              if (!parsed) continue;
+
+              if (parsed.event === "chunk") {
+                resultEl.textContent += parsed.data.chunk || "";
+                setStatus("流式输出中...");
+                continue;
+              }
+
+              if (parsed.event === "error") {
+                throw new Error(parsed.data.message || "流式翻译失败");
+              }
+
+              if (parsed.event === "done") {
+                setStatus("完成");
+              }
+            }
+          }
+        } catch (error) {
+          setStatus("失败");
+          setError(error.message || "未知错误");
+        } finally {
+          setBusy(false);
+        }
+      }
+
+      buttonEl.addEventListener("click", startStreaming);
+    </script>
   </body>
-  </html>
+</html>
