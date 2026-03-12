@@ -1088,10 +1088,8 @@
             throw new Error(message);
           }
 
-          waiting.bubble.textContent = "";
-          currentAssistantBubble = waiting;
-          startTypingPump(waiting.bubble);
           setStatus("生成中...", "working");
+          let startedStreamingRender = false;
 
           const reader = response.body.getReader();
           const decoder = new TextDecoder("utf-8");
@@ -1110,6 +1108,12 @@
               if (!parsed) continue;
 
               if (parsed.event === "chunk") {
+                if (!startedStreamingRender) {
+                  waiting.bubble.textContent = "";
+                  currentAssistantBubble = waiting;
+                  startTypingPump(waiting.bubble);
+                  startedStreamingRender = true;
+                }
                 pendingText += parsed.data.chunk || "";
               } else if (parsed.event === "session") {
                 if (parsed.data.session_id) {
@@ -1140,7 +1144,10 @@
           }
 
           streamFinished = true;
-          if (!pendingText && currentAssistantBubble && !currentAssistantBubble.bubble.textContent.trim()) {
+          if (!startedStreamingRender) {
+            waiting.bubble.classList.add("error");
+            waiting.bubble.textContent = "模型未返回有效内容，请重试。";
+          } else if (!pendingText && currentAssistantBubble && !currentAssistantBubble.bubble.textContent.trim()) {
             currentAssistantBubble.bubble.textContent = "模型未返回有效内容，请重试。";
           }
         } catch (error) {
