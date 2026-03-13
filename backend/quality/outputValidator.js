@@ -16,19 +16,33 @@ function validateOutputQuality({ direction, inputText, outputText, lang }) {
   if (direction === "product_to_dev") {
     const required =
       lang === "zh"
-        ? ["技术目标", "实现方案", "数据与依赖", "性能与风险", "MVP建议", "缺失信息"]
-        : ["Technical Goal", "Implementation Options", "Data & Dependencies", "Performance & Risks", "MVP Plan", "Missing Info"];
+        ? ["翻译结果", "开发会重点关注", "需要确认"]
+        : ["Translation", "Developer Focus", "Need Confirmation"];
     const hasAll = required.every((key) => out.includes(key));
     if (!hasAll) issues.push("缺少产品转开发模式要求的必要章节。");
+
+    const focusChecks =
+      lang === "zh"
+        ? ["算法", "数据", "性能", "工作量"]
+        : ["algorithm", "data", "performance", "effort"];
+    const hasFocus = focusChecks.every((key) => out.toLowerCase().includes(String(key).toLowerCase()));
+    if (!hasFocus) issues.push("产品转开发的输出没有覆盖算法、数据、性能、工作量这四类关键信息。");
   }
 
   if (direction === "dev_to_product") {
     const required =
       lang === "zh"
-        ? ["变更解读", "用户影响", "业务影响", "成本与效率", "上线建议", "缺失信息"]
-        : ["Change Interpretation", "User Impact", "Business Impact", "Cost & Efficiency", "Rollout Advice", "Missing Info"];
+        ? ["翻译结果", "对产品/业务的意义", "需要确认"]
+        : ["Translation", "Product/Business Meaning", "Need Confirmation"];
     const hasAll = required.every((key) => out.includes(key));
     if (!hasAll) issues.push("缺少开发转产品模式要求的必要章节。");
+
+    const focusChecks =
+      lang === "zh"
+        ? ["用户体验", "业务增长", "成本"]
+        : ["user experience", "business growth", "cost"];
+    const hasFocus = focusChecks.every((key) => out.toLowerCase().includes(String(key).toLowerCase()));
+    if (!hasFocus) issues.push("开发转产品的输出没有覆盖用户体验、业务增长、成本价值这三类关键信息。");
   }
 
   const outHasHardNumber = /\d+(\.\d+)?\s*(%|倍|ms|秒|元|万元|million|billion|\$)/i.test(out);
@@ -36,6 +50,11 @@ function validateOutputQuality({ direction, inputText, outputText, lang }) {
   const hasVerificationTag = out.includes("需验证") || /to be verified/i.test(out);
   if (outHasHardNumber && !srcHasNumber && !hasVerificationTag) {
     issues.push("输出中出现了缺乏依据的硬数字，且没有标注“需验证”。");
+  }
+
+  const hallucinatedTechPattern = /(Redis|Flink|Kafka|HBase|Hive|Feature Store|GRPC|gRPC|TensorFlow|XGBoost|Wide&Deep)/i;
+  if (direction === "product_to_dev" && hallucinatedTechPattern.test(out) && !hallucinatedTechPattern.test(src)) {
+    issues.push("输出引入了原始输入中没有出现的具体技术栈，超出了“翻译”范围。");
   }
 
   return {
