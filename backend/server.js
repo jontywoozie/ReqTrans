@@ -1,7 +1,10 @@
-﻿const fs = require("fs");
+const fs = require("fs");
 const path = require("path");
 const http = require("http");
 const crypto = require("crypto");
+const { detectInputLanguage } = require("./utils/language");
+const { buildMessages, buildUserPrompt } = require("./prompts");
+const { validateOutputQuality } = require("./quality/outputValidator");
 
 loadEnvFile(path.join(process.cwd(), ".env"));
 
@@ -92,7 +95,7 @@ function schedulePersistSessions() {
 function summarizeTitle(text, fallback = "新会话") {
   const oneLine = String(text || "").replace(/\s+/g, " ").trim();
   if (!oneLine) return fallback;
-  const firstSentence = oneLine.split(/[。！？!?]/).find((s) => s.trim()) || oneLine;
+  const firstSentence = oneLine.split(/[。！？!?]/).find((item) => item.trim()) || oneLine;
   const clean = firstSentence.trim();
   return clean.length > 30 ? `${clean.slice(0, 30)}...` : clean;
 }
@@ -135,13 +138,13 @@ function loadSessionsFromDisk() {
 function getSessionSummaries() {
   return Array.from(sessions.values())
     .sort((a, b) => b.updatedAt - a.updatedAt)
-    .map((s) => ({
-      id: s.id,
-      title: s.title,
-      direction: s.direction,
-      preview: s.preview || "",
-      updated_at: s.updatedAt,
-      created_at: s.createdAt
+    .map((session) => ({
+      id: session.id,
+      title: session.title,
+      direction: session.direction,
+      preview: session.preview || "",
+      updated_at: session.updatedAt,
+      created_at: session.createdAt
     }));
 }
 
@@ -178,6 +181,7 @@ function getOrCreateSession(sessionId, direction, title) {
     if (changed) schedulePersistSessions();
     return session;
   }
+
   return createSession(direction, title);
 }
 
@@ -220,149 +224,6 @@ function collectJsonBody(req) {
     });
     req.on("error", () => reject(new Error("Failed to read request body")));
   });
-}
-
-function detectInputLanguage(text) {
-  const content = String(text || "");
-  const cjkCount = (content.match(/[\u4e00-\u9fff]/g) || []).length;
-  const latinCount = (content.match(/[A-Za-z]/g) || []).length;
-  return cjkCount >= latinCount ? "zh" : "en";
-}
-
-function buildRolePrompt(direction) {
-  if (direction === "free_chat") {
-    return [
-      "You are a practical assistant for daily conversation.",
-      "Respond naturally and clearly.",
-      "Keep concise unless the user asks for detail."
-    ].join(" ");
-  }
-
-  if (direction === "product_to_dev") {
-    return [
-      "You are a senior engineering architect translating PM language into executable engineering language.",
-      "Think in terms of architecture, data dependencies, performance constraints, implementation scope, and risk.",
-      "Avoid business fluff and focus on actionable engineering decisions."
-    ].join(" ");
-  }
-
-  return [
-    "You are a senior product strategist translating engineering language into product/business language.",
-    "Think in terms of user impact, business impact, rollout plan, and decision support.",
-    "Avoid raw technical jargon without business interpretation."
-  ].join(" ");
-}
-
-function buildOutputSchemaPrompt(direction, lang) {
-  if (lang === "zh") {
-    if (direction === "free_chat") {
-      return [
-        "输出必须为中文。",
-        "除非用户明确要求，否则不要强制分段标题。",
-        "如存在不确定信息，请明确标注“需验证”，并给出一个澄清问题。"
-      ].join(" ");
-    }
-
-    if (direction === "product_to_dev") {
-      return [
-        "输出必须为中文，且小标题必须是中文。",
-        "严格使用以下标题顺序：",
-        "【技术目标】、【实现方案】、【数据与依赖】、【性能与风险】、【MVP建议】、【缺失信息】。",
-        "每个标题下给出简洁要点。",
-        "如无缺失信息，写“无”。"
-      ].join(" ");
-    }
-
-    return [
-      "输出必须为中文，且小标题必须是中文。",
-      "严格使用以下标题顺序：",
-      "【变更解读】、【用户影响】、【业务影响】、【成本与效率】、【上线建议】、【缺失信息】。",
-      "每个标题下给出简洁要点。",
-      "如无缺失信息，写“无”。"
-    ].join(" ");
-  }
-
-  if (direction === "free_chat") {
-    return [
-      "Output must be in English.",
-      "Do not force section headings unless user asks.",
-      "If uncertain, explicitly say unknown and ask one clarifying question."
-    ].join(" ");
-  }
-
-  if (direction === "product_to_dev") {
-    return [
-      "Output must be in English.",
-      "Use this exact section order:",
-      "[Technical Goal], [Implementation Options], [Data & Dependencies], [Performance & Risks], [MVP Plan], [Missing Info].",
-      "Each section should contain concise bullet points.",
-      "If no missing info, write 'None'."
-    ].join(" ");
-  }
-
-  return [
-    "Output must be in English.",
-    "Use this exact section order:",
-    "[Change Interpretation], [User Impact], [Business Impact], [Cost & Efficiency], [Rollout Advice], [Missing Info].",
-    "Each section should contain concise bullet points.",
-    "If no missing info, write 'None'."
-  ].join(" ");
-}
-
-function buildQualityGuardPrompt() {
-  return [
-    "Never fabricate percentages, benchmark numbers, or monetary outcomes.",
-    "If a number is not directly grounded in user input/history, mark it as '需验证' or 'to be verified'.",
-    "For every inference, prefer explicit uncertainty over confident guessing.",
-    "Make output directly usable in a product/engineering sync meeting."
-  ].join(" ");
-}
-
-function buildUserPrompt(direction, text, lang) {
-  const langHint =
-    lang === "zh"
-      ? "请严格使用中文。若有任何未确认数据，标注“需验证”。"
-      : "Please strictly use English. Mark uncertain numbers as 'to be verified'.";
-
-  if (direction === "free_chat") {
-    return [langHint, "", text].join("\n");
-  }
-
-  if (direction === "product_to_dev") {
-    return [
-      langHint,
-      "Translate the PM statement into engineering execution language.",
-      "Focus on implementation realism and missing constraints.",
-      "",
-      "Input:",
-      text
-    ].join("\n");
-  }
-
-  return [
-    langHint,
-    "Translate the engineering update into product/business decision language.",
-    "Focus on user/business implications and rollout guidance.",
-    "",
-    "Input:",
-    text
-  ].join("\n");
-}
-
-function buildMessages(direction, text, sessionHistory) {
-  const lang = detectInputLanguage(text);
-  const messages = [
-    { role: "system", content: buildRolePrompt(direction) },
-    { role: "system", content: buildOutputSchemaPrompt(direction, lang) },
-    { role: "system", content: buildQualityGuardPrompt() }
-  ];
-
-  for (const item of sessionHistory) {
-    messages.push({ role: item.role, content: item.content });
-  }
-
-  messages.push({ role: "user", content: buildUserPrompt(direction, text, lang) });
-  return { messages, lang };
 }
 
 function sleep(ms) {
@@ -415,11 +276,7 @@ async function callOpenAiCompatible({ messages, temperature = 0.6 }) {
     }
 
     const choice = parsed?.choices?.[0] || {};
-    const content =
-      choice?.message?.content ||
-      choice?.text ||
-      choice?.delta?.content ||
-      "";
+    const content = choice?.message?.content || choice?.text || choice?.delta?.content || "";
 
     if (!String(content).trim()) {
       throw new Error("Model produced no visible text");
@@ -431,51 +288,8 @@ async function callOpenAiCompatible({ messages, temperature = 0.6 }) {
   if (lastStatus === 429) {
     throw new Error("模型当前繁忙（429），已自动重试仍失败，请稍后再试。");
   }
+
   throw new Error(`Upstream LLM error (${lastStatus || "unknown"}): ${lastReason || "unknown error"}`);
-}
-
-function validateOutputQuality({ direction, inputText, outputText, lang }) {
-  const issues = [];
-  const out = String(outputText || "").trim();
-  const src = String(inputText || "");
-
-  if (!out) issues.push("Output is empty.");
-
-  if (lang === "zh") {
-    const cjkRatio = ((out.match(/[\u4e00-\u9fff]/g) || []).length / Math.max(out.length, 1));
-    if (cjkRatio < 0.15) issues.push("Language mismatch: expected Chinese output.");
-  } else {
-    const latinRatio = ((out.match(/[A-Za-z]/g) || []).length / Math.max(out.length, 1));
-    if (latinRatio < 0.15) issues.push("Language mismatch: expected English output.");
-  }
-
-  if (direction === "product_to_dev") {
-    const required = lang === "zh"
-      ? ["技术目标", "实现方案", "数据与依赖", "性能与风险", "MVP建议", "缺失信息"]
-      : ["Technical Goal", "Implementation Options", "Data & Dependencies", "Performance & Risks", "MVP Plan", "Missing Info"];
-    const hasAll = required.every((k) => out.includes(k));
-    if (!hasAll) issues.push("Missing required sections for product_to_dev output.");
-  }
-
-  if (direction === "dev_to_product") {
-    const required = lang === "zh"
-      ? ["变更解读", "用户影响", "业务影响", "成本与效率", "上线建议", "缺失信息"]
-      : ["Change Interpretation", "User Impact", "Business Impact", "Cost & Efficiency", "Rollout Advice", "Missing Info"];
-    const hasAll = required.every((k) => out.includes(k));
-    if (!hasAll) issues.push("Missing required sections for dev_to_product output.");
-  }
-
-  const outHasHardNumber = /\d+(\.\d+)?\s*(%|倍|ms|秒|元|万元|million|billion|\$)/i.test(out);
-  const srcHasNumber = /\d/.test(src);
-  const hasVerificationTag = out.includes("需验证") || /to be verified/i.test(out);
-  if (outHasHardNumber && !srcHasNumber && !hasVerificationTag) {
-    issues.push("Contains hard numbers without evidence or verification tag.");
-  }
-
-  return {
-    pass: issues.length === 0,
-    issues
-  };
 }
 
 async function generateWithQualityGuard({ direction, text, sessionHistory }) {
@@ -503,7 +317,7 @@ async function generateWithQualityGuard({ direction, text, sessionHistory }) {
         `Direction: ${direction}`,
         `Input language: ${lang}`,
         "Issues:",
-        ...check.issues.map((x) => `- ${x}`),
+        ...check.issues.map((item) => `- ${item}`),
         "",
         "Original user input:",
         text,
@@ -521,19 +335,19 @@ async function generateWithQualityGuard({ direction, text, sessionHistory }) {
 
 function streamTextAsSse(res, text) {
   const content = String(text || "");
-  let i = 0;
+  let index = 0;
 
   return new Promise((resolve) => {
     const timer = setInterval(() => {
-      if (i >= content.length) {
+      if (index >= content.length) {
         clearInterval(timer);
         resolve();
         return;
       }
 
       const step = Math.max(4, Math.min(18, Math.floor(content.length / 60)));
-      const chunk = content.slice(i, i + step);
-      i += step;
+      const chunk = content.slice(index, index + step);
+      index += step;
       writeSseEvent(res, "chunk", { chunk });
     }, 12);
   });
